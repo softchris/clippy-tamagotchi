@@ -4,6 +4,9 @@
 import { createServer } from "node:http";
 import https from "node:https";
 import { execSync } from "node:child_process";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
 
 // Cache for agent files fetched from GitHub
@@ -25,26 +28,24 @@ const petStates = new Map();
 const AVAILABLE_PETS = ["Clippy","Bonzi","F1","Genie","Genius","Links","Merlin","Peedy","Rocky","Rover"];
 
 function getDefaultState(petName) {
-    return { name: petName||"Clippy", nickname:"", hunger:80, happiness:80, energy:80, hygiene:80, age:0, lastUpdate:Date.now(), alive:true };
+    return { name: petName||"Clippy", nickname:"", hunger:80, happiness:80, energy:80, hygiene:80, age:0, lastUpdate:Date.now() };
 }
 
 function decayStats(state) {
     const now = Date.now();
     const ticks = Math.floor((now - state.lastUpdate) / 10000);
-    if (ticks > 0 && state.alive) {
-        state.hunger = Math.max(0, state.hunger - ticks * 2);
-        state.happiness = Math.max(0, state.happiness - ticks * 1);
-        state.energy = Math.max(0, state.energy - ticks * 0.6);
-        state.hygiene = Math.max(0, state.hygiene - ticks * 0.8);
+    if (ticks > 0) {
+        state.hunger = Math.max(1, state.hunger - ticks * 2);
+        state.happiness = Math.max(1, state.happiness - ticks * 1);
+        state.energy = Math.max(1, state.energy - ticks * 0.6);
+        state.hygiene = Math.max(1, state.hygiene - ticks * 0.8);
         state.age += ticks;
         state.lastUpdate = now;
-        if (state.hunger <= 0 && state.happiness <= 0) state.alive = false;
     }
     return state;
 }
 
 function getThought(state) {
-    if (!state.alive) return { text: "...", emoji: "\ud83d\udc80" };
     const stats = [
         { key:"hunger", val:state.hunger, thoughts:[
             {t:30, text:"I'm STARVING! Please feed me!", emoji:"\ud83e\udd7a"},
@@ -81,8 +82,6 @@ function getThought(state) {
 }
 
 function handleAction(state, action, body) {
-    if (!state.alive && action !== "reset")
-        return { state, message: state.name+" is no longer with us...", animation:null, effect:null, thought:getThought(state) };
     let message="", animation="", effect="";
     switch (action) {
         case "feed":
@@ -451,7 +450,7 @@ h1 {
         </div>
 
         <h3>\u26a0\ufe0f Stat Decay</h3>
-        <p class="modal-desc">Stats decay over time! If any stat hits 0, Clippy dies \ud83d\udc80. Keep working and caring to stay alive.</p>
+        <p class="modal-desc">Stats decay over time! Keep working and caring for Clippy to maintain high stats.</p>
 
         <h3>\ud83d\udca1 Tips</h3>
         <div class="modal-grid">
@@ -559,7 +558,7 @@ function addLogEntry(emoji, message, effect, sentiment, timestamp){
 }
 
 function pickIdleAnim(){
-    if(!state||!state.alive) return "idle-sleep";
+    if(!state) return "idle-sleep";
     var avg=(state.hunger+state.happiness+state.energy+state.hygiene)/4;
     if(state.energy<30) return "idle-sleep";
     if(avg<30) return "idle-dizzy";
@@ -709,7 +708,7 @@ var clippyIdleLoop=null;
 function startClippyIdleLoop(){
     clearInterval(clippyIdleLoop);
     clippyIdleLoop=setInterval(function(){
-        if(!agent||!state||!state.alive) return;
+        if(!agent||!state) return;
         var anims;
         if(state.energy<30) anims=["Processing","IdleRopePile","Idle1_1"];
         else if(state.happiness<30) anims=["Sad","Wave","LookDown"];
@@ -758,21 +757,13 @@ function updateUI(){
     var avg=(state.hunger+state.happiness+state.energy+state.hygiene)/4;
     var dn=state.nickname||state.name;
     var mood="";
-    if(!state.alive) mood="\ud83d\udc80 "+dn+" has passed away...";
-    else if(avg>70) mood="\u2728 "+dn+" is thriving!";
+    if(avg>70) mood="\u2728 "+dn+" is thriving!";
     else if(avg>50) mood="\ud83d\ude0a "+dn+" is doing okay";
     else if(avg>30) mood="\ud83d\ude1f "+dn+" needs attention!";
     else mood="\ud83d\ude30 "+dn+" is in critical condition!";
     document.getElementById("mood").textContent=mood;
     if(!isEditing) renderNameArea();
     cycleIdleAnim();
-    var existing=document.querySelector(".dead-overlay"); if(existing) existing.remove();
-    if(!state.alive){
-        var ov=document.createElement("div"); ov.className="dead-overlay";
-        ov.innerHTML='<span>\ud83d\udc80</span><p>R.I.P. '+dn+'</p><button class="reset-btn" id="revive-btn">Revive Pet</button>';
-        document.getElementById("pet-stage").appendChild(ov);
-        document.getElementById("revive-btn").addEventListener("click",function(){doAction("reset")});
-    }
 }
 function doAction(action){
     var btns=document.querySelectorAll(".action-btn");
@@ -793,7 +784,7 @@ function doAction(action){
     }).catch(function(){btns.forEach(function(b){b.disabled=false})});
 }
 setInterval(function(){
-    if(!state||!state.alive) return;
+    if(!state) return;
     fetch("/api/thought").then(function(r){return r.json()}).then(function(t){showThought(t)}).catch(function(){});
 },8000);
 
@@ -950,7 +941,17 @@ function pushSessionEvent(instanceId, event) {
 
 // --- GitHub Activity Polling ---
 
-const WATCHED_REPOS = ["github/devrel","softchris/mcp-book","softchris/agentic-book","softchris/mmm","softchris/mcp-workshop","microsoft/Web-Dev-For-Beginners"];
+// Auto-discover watched repos from user's recent activity (owned + contributed to)
+let WATCHED_REPOS = [];
+try {
+    const repoResult = execSync("gh api graphql -f query=" + JSON.stringify("{viewer{repositories(first:15,orderBy:{field:PUSHED_AT,direction:DESC}){nodes{nameWithOwner}}repositoriesContributedTo(first:10,orderBy:{field:PUSHED_AT,direction:DESC},contributionTypes:[COMMIT,PULL_REQUEST,ISSUE]){nodes{nameWithOwner}}}}") + " 2>nul", { encoding: "utf-8", timeout: 10000 });
+    const repoData = JSON.parse(repoResult);
+    const owned = (repoData.data.viewer.repositories.nodes || []).map(n => n.nameWithOwner);
+    const contributed = (repoData.data.viewer.repositoriesContributedTo.nodes || []).map(n => n.nameWithOwner);
+    WATCHED_REPOS = [...new Set([...owned, ...contributed])];
+} catch (e) {
+    WATCHED_REPOS = [];
+}
 const lastSeenEventIds = new Set();
 let ghPollInitialized = false;
 let ghUsername = "";
@@ -1003,7 +1004,7 @@ function mapGitHubEvent(ghEvent) {
 function applyEventStats(eventType) {
     // Apply stat changes to all open pet instances
     for (const [instId, state] of petStates.entries()) {
-        if (!state.alive) continue;
+        
         if (["build_success", "tests_passed", "pr_merged", "achievement", "issue_closed"].includes(eventType)) {
             state.happiness = Math.min(100, state.happiness + 10);
             state.energy = Math.min(100, state.energy + 5);
@@ -1197,7 +1198,7 @@ const session = await joinSession({
         createCanvas({
             id: "clippy-tamagotchi",
             displayName: "Clippy Tamagotchi",
-            description: "A Tamagotchi-style virtual pet game featuring Clippy and MS Office assistant friends. Feed, play, rest, and clean your pet to keep it happy and alive!",
+            description: "A Tamagotchi-style virtual pet game featuring Clippy and MS Office assistant friends. Feed, play, rest, and clean your pet to keep it happy!",
             inputSchema: { type: "object", properties: { pet: { type: "string", description: "Which pet to start with", enum: AVAILABLE_PETS } } },
             actions: [
                 { name: "feed", description: "Feed the pet to increase hunger satisfaction",

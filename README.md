@@ -10,12 +10,15 @@ A Tamagotchi-style virtual pet canvas extension for the [GitHub Copilot](https:/
 
 - **10 Classic Characters** — Clippy, Bonzi, F1, Genie, Genius, Links, Merlin, Peedy, Rocky, Rover
 - **Tamagotchi Mechanics** — Feed, play, sleep, and clean your pet to keep stats up
+- **No Death** — Clippy never dies! Stats floor at minimum values (but very low stats = sad Clippy)
+- **Auto-Discovers Repos** — Automatically watches your owned + contributed repos (no config needed!)
 - **Name Your Pet** — Give your companion a custom nickname
 - **Thought Bubbles** — Clippy tells you what they need based on their lowest stat
 - **Idle Animations** — Characters bounce, wander, sleep, and react based on mood
 - **🌙/☀️ Theme Toggle** — Dark and light mode support
 - **🔇 Mute Button** — Silence clippy.js sounds with one click (persists across reloads)
 - **💤 Sleep Recovery** — Friendly overlay with "Wake Up" button if the extension restarts
+- **❓ About Modal** — Explains all rewards and mechanics in-app
 
 ## 🚀 Session Awareness
 
@@ -102,26 +105,17 @@ Or the agent may open it automatically when relevant.
 | 💤 | Bottom | Put pet to sleep |
 | 🧼 | Bottom | Clean pet |
 
-### Configuring Watched Repos
+### Repo Discovery
 
-By default, the extension watches these repos (edit `WATCHED_REPOS` in `extension.mjs`):
+The extension **automatically discovers your repos** on startup using the GitHub GraphQL API. It watches:
+- Your 15 most recently pushed repos
+- Up to 10 repos you've contributed to (via commits, PRs, or issues)
 
-```js
-const WATCHED_REPOS = [
-  "github/devrel",
-  "softchris/mcp-book",
-  "softchris/agentic-book",
-  "softchris/mmm",
-  "softchris/mcp-workshop",
-  "microsoft/Web-Dev-For-Beginners"
-];
-```
+No configuration needed! Just make sure `gh` CLI is authenticated.
 
-Change these to your own repos to track your activity!
+## 📉 Stat Decay
 
-## ⚠️ Stat Decay
-
-Stats decay over time! If any stat hits 0, Clippy dies 💀. Keep working and caring to stay alive. You can revive with the "Revive Pet" button.
+Stats decay over time. Clippy can never die, but very low stats make them sad and desperate for attention! Keep working and caring to maintain high stats.
 
 ## 🛠️ Development
 
