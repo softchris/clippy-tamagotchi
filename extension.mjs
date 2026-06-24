@@ -409,7 +409,7 @@ h1 {
         </div>
         <div class="tab-panel" id="panel-log">
             <div class="activity-log" id="activity-log">
-                <div class="log-empty">\ud83c\udf31 No activity yet \u2014 start coding and watch Clippy thrive!</div>
+               <div class="log-empty" id="log-loading">\u231b Loading GitHub activity...</div>
             </div>
         </div>
         <div class="tab-panel hidden" id="panel-guide">
@@ -891,19 +891,34 @@ function pollEvents(){
 }
 
 // Also load today's activity history on startup
-fetch("/api/today").then(function(r){return r.json()}).then(function(data){
-    if(!data||!data.events||!data.events.length) return;
-    // Sort by timestamp ascending so newest ends up on top
-    data.events.sort(function(a,b){return a.timestamp-b.timestamp});
-    data.events.forEach(function(ev){
-        var effect=EFFECT_MAP[ev.type]||"";
-        var sentiment=SENTIMENT_MAP[ev.type]||"neutral";
-        addLogEntry(ev.emoji, ev.message, effect, sentiment, ev.timestamp);
-    });
-    // Show daily summary
-    var summary=document.getElementById("daily-summary");
-    if(summary) summary.textContent="\ud83d\udcc5 Today: "+data.events.length+" action"+(data.events.length===1?"":"s")+" \u2022 Keep going!";
-}).catch(function(){});
+// Poll gh-status until ready, then load today's events
+var ghStatusReady=false;
+function checkGhStatus(){
+    fetch("/api/gh-status").then(function(r){return r.json()}).then(function(d){
+        if(!d.ready) return;
+        ghStatusReady=true;
+        var loading=document.getElementById("log-loading");
+        if(loading) loading.textContent="\ud83c\udf31 No activity yet \u2014 start coding and watch Clippy thrive!";
+        // Load today's events now
+        fetch("/api/today").then(function(r){return r.json()}).then(function(data){
+            if(!data||!data.events||!data.events.length) return;
+            if(loading) loading.remove();
+            data.events.sort(function(a,b){return a.timestamp-b.timestamp});
+            data.events.forEach(function(ev){
+                var effect=EFFECT_MAP[ev.type]||"";
+                var sentiment=SENTIMENT_MAP[ev.type]||"neutral";
+                addLogEntry(ev.emoji, ev.message, effect, sentiment, ev.timestamp);
+            });
+            var summary=document.getElementById("daily-summary");
+            if(summary) summary.textContent="\ud83d\udcc5 Today: "+data.events.length+" action"+(data.events.length===1?"":"s")+" \u2022 Keep going!";
+        }).catch(function(){});
+    }).catch(function(){});
+}
+var ghStatusInterval=setInterval(function(){
+    if(ghStatusReady){clearInterval(ghStatusInterval);return;}
+    checkGhStatus();
+},2000);
+checkGhStatus();
 
 setInterval(pollEvents,30000); pollEvents();
 
@@ -952,9 +967,11 @@ async function startServer(instanceId) {
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify(events));
         } else if (req.url === "/api/today" && req.method === "GET") {
-            // Return today's full activity history
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify({ events: todayEvents }));
+        } else if (req.url === "/api/gh-status" && req.method === "GET") {
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ ready: ghInitDone, repos: WATCHED_REPOS.length, username: ghUsername }));
         } else if (req.url === "/api/action" && req.method === "POST") {
             let body = "";
             req.on("data", (chunk) => { body += chunk; });
@@ -1040,6 +1057,7 @@ let WATCHED_REPOS = [];
 let ghUsername = "";
 const lastSeenEventIds = new Set();
 let ghPollInitialized = false;
+let ghInitDone = false;
 const todayEvents = [];
 
 // Async init — discover repos and username without blocking the event loop
@@ -1119,13 +1137,14 @@ async function pollGitHubActivity() {
     const todayIso = todayStart.toISOString();
     const todayMs = todayStart.getTime();
 
-    for (const repo of WATCHED_REPOS) {
+    // Query all repos in parallel (not sequentially)
+    await Promise.allSettled(WATCHED_REPOS.map(async (repo) => {
         const [owner, name] = repo.split("/");
         try {
             const query = `{ repository(owner:"${owner}", name:"${name}") { issues(first:10, orderBy:{field:UPDATED_AT, direction:DESC}, filterBy:{since:"${todayIso}"}) { nodes { number title createdAt updatedAt state author { login } comments(last:1) { nodes { createdAt author { login } } } } } pullRequests(first:5, orderBy:{field:UPDATED_AT, direction:DESC}) { nodes { number title createdAt updatedAt state merged mergedAt author { login } } } } }`;
             const data = await ghGraphQL(query, 15000);
             const repoData = data.data && data.data.repository;
-            if (!repoData) continue;
+            if (!repoData) return;
 
             // Process issues
             const issues = (repoData.issues && repoData.issues.nodes) || [];
@@ -1134,12 +1153,10 @@ async function pollGitHubActivity() {
                 const createdAt = new Date(issue.createdAt).getTime();
                 if (updatedAt < todayMs) continue;
 
-                // Check if the user authored or commented
                 const isAuthor = issue.author && issue.author.login && issue.author.login.toLowerCase() === ghUsername.toLowerCase();
                 const lastComment = issue.comments && issue.comments.nodes && issue.comments.nodes[0];
                 const userCommented = lastComment && lastComment.author && lastComment.author.login && lastComment.author.login.toLowerCase() === ghUsername.toLowerCase();
 
-                // Generate unique event IDs based on issue + timestamp
                 if (userCommented) {
                     const commentTime = new Date(lastComment.createdAt).getTime();
                     const evId = `comment-${repo}-${issue.number}-${commentTime}`;
@@ -1165,7 +1182,6 @@ async function pollGitHubActivity() {
                             applyEventStats(mapped.type);
                         }
                     } else {
-                        // Use createdAt for issue creation — not updatedAt
                         const evId = `issue-${repo}-${issue.number}`;
                         if (!lastSeenEventIds.has(evId)) {
                             lastSeenEventIds.add(evId);
@@ -1214,9 +1230,8 @@ async function pollGitHubActivity() {
         } catch (e) {
             // gh CLI not available or rate limited — skip silently
         }
-    }
+    }));
     ghPollInitialized = true;
-    // Trim seen set to avoid memory growth
     if (lastSeenEventIds.size > 500) {
         const arr = [...lastSeenEventIds];
         arr.splice(0, arr.length - 200);
@@ -1227,9 +1242,9 @@ async function pollGitHubActivity() {
 
 // Async init: discover repos, then start polling (never blocks event loop)
 initGitHubData().then(() => {
-    pollGitHubActivity();
+    pollGitHubActivity().then(() => { ghInitDone = true; });
     setInterval(() => pollGitHubActivity(), 30000);
-}).catch(() => {});
+}).catch(() => { ghInitDone = true; });
 
 const session = await joinSession({
     tools: [

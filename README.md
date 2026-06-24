@@ -59,7 +59,7 @@ Clippy reacts to your real GitHub activity in real-time!
 3. Select **"Install extension from gist"**
 4. Paste this gist URL:
    ```
-   https://gist.github.com/softchris/ac4daecf777f3bd2a3250cfee8bfda32
+   https://gist.github.com/softchris/75d78a78cf970a0bb4a6380e3cbd5090
    ```
 5. Choose **User** scope (installs for you across all projects)
 
