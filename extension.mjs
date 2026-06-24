@@ -731,21 +731,56 @@ function refreshState(){
         connectionFails=0;
     }).catch(function(){
         connectionFails++;
-        if(connectionFails>=3) showSleepOverlay();
+        if(connectionFails>=5) showSleepOverlay();
     });
 }
 var connectionFails=0;
+var wakeRetrying=false;
 function showSleepOverlay(){
     if(document.getElementById("sleep-overlay")) return;
     var ov=document.createElement("div");
     ov.id="sleep-overlay";
     ov.className="sleep-overlay";
-    ov.innerHTML='<div class="sleep-content"><span class="sleep-icon">\ud83d\udca4</span><p>Clippy fell asleep...</p><p class="sleep-hint">The extension restarted. Click below to wake up!</p><button class="wake-btn" id="wake-btn">\u2615 Wake Up Clippy</button></div>';
+    ov.innerHTML='<div class="sleep-content"><span class="sleep-icon">\ud83d\udca4</span><p>Clippy fell asleep...</p><p class="sleep-hint">The extension is reconnecting...</p><button class="wake-btn" id="wake-btn">\u2615 Wake Up Clippy</button><p class="sleep-status" id="sleep-status"></p></div>';
     document.body.appendChild(ov);
+    // Auto-recovery: start polling immediately
+    startWakeRetry();
     document.getElementById("wake-btn").addEventListener("click",function(){
-        // Attempt to reload — if the extension restarted, the host will re-route to new port
-        window.location.reload();
+        startWakeRetry();
     });
+}
+function startWakeRetry(){
+    if(wakeRetrying) return;
+    wakeRetrying=true;
+    var btn=document.getElementById("wake-btn");
+    var statusEl=document.getElementById("sleep-status");
+    if(btn) btn.textContent="\u231b Reconnecting...";
+    if(btn) btn.disabled=true;
+    var attempts=0;
+    var maxAttempts=30;
+    var retryInterval=setInterval(function(){
+        attempts++;
+        if(statusEl) statusEl.textContent="Attempt "+attempts+"/"+maxAttempts+"...";
+        fetch("/api/state").then(function(r){
+            if(!r.ok) throw new Error("offline");
+            return r.json();
+        }).then(function(s){
+            // Server is back!
+            clearInterval(retryInterval);
+            wakeRetrying=false;
+            state=s; connectionFails=0;
+            var sleepOv=document.getElementById("sleep-overlay");
+            if(sleepOv) sleepOv.remove();
+            updateUI();
+        }).catch(function(){
+            if(attempts>=maxAttempts){
+                clearInterval(retryInterval);
+                wakeRetrying=false;
+                if(btn){ btn.textContent="\u2615 Wake Up Clippy"; btn.disabled=false; }
+                if(statusEl) statusEl.textContent="Still sleeping. The host will auto-reconnect when the extension restarts.";
+            }
+        });
+    },2000);
 }
 function updateUI(){
     if(!state) return;
@@ -1186,6 +1221,29 @@ const session = await joinSession({
                 return { ok: true, message: "Clippy noticed: " + message };
             },
         },
+        {
+            name: "wake_clippy",
+            description: "Wake up the Clippy Tamagotchi canvas if it's showing a connection error or is unresponsive. Use when the user says 'wake up', 'clippy is dead', 'canvas won't load', or similar. This reopens the canvas panel with the current server URL.",
+            parameters: {
+                type: "object",
+                properties: {},
+            },
+            handler: async (ctx) => {
+                // Find any active server and return its URL so the agent can reopen the canvas
+                const activeInstances = [];
+                for (const [instId, entry] of servers.entries()) {
+                    activeInstances.push({ instanceId: instId, url: entry.url });
+                }
+                if (activeInstances.length === 0) {
+                    return { ok: false, message: "No active Clippy servers found. Try opening the canvas fresh with open_canvas." };
+                }
+                return {
+                    ok: true,
+                    message: "Clippy is alive! The agent should call open_canvas with canvasId 'clippy-tamagotchi' and instanceId '" + activeInstances[0].instanceId + "' to refresh the panel.",
+                    instances: activeInstances,
+                };
+            },
+        },
     ],
     hooks: {
         onUserPromptSubmitted: async () => {
@@ -1222,8 +1280,14 @@ const session = await joinSession({
             ],
             open: async (ctx) => {
                 if (ctx.input && ctx.input.pet) petStates.set(ctx.instanceId, getDefaultState(ctx.input.pet));
-                let entry = servers.get(ctx.instanceId);
-                if (!entry) { entry = await startServer(ctx.instanceId); servers.set(ctx.instanceId, entry); }
+                // Always tear down old server and start fresh (handles rehydration after restart)
+                const oldEntry = servers.get(ctx.instanceId);
+                if (oldEntry) {
+                    servers.delete(ctx.instanceId);
+                    try { oldEntry.server.close(); } catch(_) {}
+                }
+                const entry = await startServer(ctx.instanceId);
+                servers.set(ctx.instanceId, entry);
                 const pet = petStates.get(ctx.instanceId)?.name || "Clippy";
                 return { title: "\ud83d\udcce C.L.I.P.P.Y. - " + pet, url: entry.url };
             },
