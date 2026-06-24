@@ -3,11 +3,25 @@
 
 import { createServer } from "node:http";
 import https from "node:https";
-import { execSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
+
+// Async gh CLI helper — never blocks the event loop
+function ghGraphQL(query, timeoutMs = 10000) {
+    return new Promise((resolve, reject) => {
+        const child = execFile("gh", ["api", "graphql", "-f", "query=" + query], {
+            encoding: "utf-8",
+            timeout: timeoutMs,
+            windowsHide: true,
+        }, (err, stdout) => {
+            if (err) return reject(err);
+            try { resolve(JSON.parse(stdout || "{}")); } catch (e) { reject(e); }
+        });
+    });
+}
 
 // Cache for agent files fetched from GitHub
 const agentCache = new Map();
@@ -900,6 +914,24 @@ setInterval(refreshState,5000); setInterval(cycleIdleAnim,8000);
 </html>`;
 }
 
+// Stable-port persistence: remember ports so restarts reclaim the same port
+const PORTS_FILE = join(homedir(), ".copilot", "extensions", "clippy-tamagotchi", "artifacts", "server-ports.json");
+
+function loadPortMap() {
+    try {
+        if (existsSync(PORTS_FILE)) return JSON.parse(readFileSync(PORTS_FILE, "utf8"));
+    } catch (_) {}
+    return {};
+}
+
+function savePortMap(map) {
+    try {
+        const dir = join(homedir(), ".copilot", "extensions", "clippy-tamagotchi", "artifacts");
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+        writeFileSync(PORTS_FILE, JSON.stringify(map, null, 2));
+    } catch (_) {}
+}
+
 async function startServer(instanceId) {
     let state = petStates.get(instanceId) || getDefaultState("Clippy");
     petStates.set(instanceId, state);
@@ -958,10 +990,37 @@ async function startServer(instanceId) {
             res.end(renderHtml(instanceId));
         }
     });
-    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    const port = typeof address === "object" && address ? address.port : 0;
-    return { server, url: `http://127.0.0.1:${port}/` };
+    // Try to reclaim the previously used port for this instance
+    const portMap = loadPortMap();
+    const preferredPort = portMap[instanceId] || 0;
+    let boundPort;
+    try {
+        boundPort = await new Promise((resolve, reject) => {
+            const onError = (err) => {
+                if (err.code === "EADDRINUSE" && preferredPort !== 0) {
+                    // Port taken — fall back to random
+                    server.listen(0, "127.0.0.1", () => {
+                        server.removeListener("error", onError);
+                        resolve(server.address().port);
+                    });
+                } else {
+                    reject(err);
+                }
+            };
+            server.once("error", onError);
+            server.listen(preferredPort, "127.0.0.1", () => {
+                server.removeListener("error", onError);
+                resolve(server.address().port);
+            });
+        });
+    } catch (_) {
+        // Last resort: random port
+        boundPort = await new Promise((r) => server.listen(0, "127.0.0.1", () => r(server.address().port)));
+    }
+    // Persist the port for next restart
+    portMap[instanceId] = boundPort;
+    savePortMap(portMap);
+    return { server, url: `http://127.0.0.1:${boundPort}/` };
 }
 
 // Session events queue - pushed by the agent tool, consumed by canvas via SSE
@@ -978,27 +1037,27 @@ function pushSessionEvent(instanceId, event) {
 
 // Auto-discover watched repos from user's recent activity (owned + contributed to)
 let WATCHED_REPOS = [];
-try {
-    const repoResult = execSync("gh api graphql -f query=" + JSON.stringify("{viewer{repositories(first:15,orderBy:{field:PUSHED_AT,direction:DESC}){nodes{nameWithOwner}}repositoriesContributedTo(first:10,orderBy:{field:PUSHED_AT,direction:DESC},contributionTypes:[COMMIT,PULL_REQUEST,ISSUE]){nodes{nameWithOwner}}}}") + " 2>nul", { encoding: "utf-8", timeout: 10000 });
-    const repoData = JSON.parse(repoResult);
-    const owned = (repoData.data.viewer.repositories.nodes || []).map(n => n.nameWithOwner);
-    const contributed = (repoData.data.viewer.repositoriesContributedTo.nodes || []).map(n => n.nameWithOwner);
-    WATCHED_REPOS = [...new Set([...owned, ...contributed])];
-} catch (e) {
-    WATCHED_REPOS = [];
-}
+let ghUsername = "";
 const lastSeenEventIds = new Set();
 let ghPollInitialized = false;
-let ghUsername = "";
-const todayEvents = []; // All of today's events for the daily summary
+const todayEvents = [];
 
-// Resolve authenticated GitHub user
-try {
-    const loginResult = execSync("gh api graphql -f query=" + JSON.stringify("{viewer{login}}") + " 2>nul", { encoding: "utf-8", timeout: 5000 });
-    const loginData = JSON.parse(loginResult);
-    ghUsername = (loginData.data && loginData.data.viewer && loginData.data.viewer.login) || "";
-} catch (e) {
-    ghUsername = "";
+// Async init — discover repos and username without blocking the event loop
+async function initGitHubData() {
+    try {
+        const repoData = await ghGraphQL("{viewer{repositories(first:15,orderBy:{field:PUSHED_AT,direction:DESC}){nodes{nameWithOwner}}repositoriesContributedTo(first:10,orderBy:{field:PUSHED_AT,direction:DESC},contributionTypes:[COMMIT,PULL_REQUEST,ISSUE]){nodes{nameWithOwner}}}}");
+        const owned = (repoData.data.viewer.repositories.nodes || []).map(n => n.nameWithOwner);
+        const contributed = (repoData.data.viewer.repositoriesContributedTo.nodes || []).map(n => n.nameWithOwner);
+        WATCHED_REPOS = [...new Set([...owned, ...contributed])];
+    } catch (e) {
+        WATCHED_REPOS = [];
+    }
+    try {
+        const loginData = await ghGraphQL("{viewer{login}}", 5000);
+        ghUsername = (loginData.data && loginData.data.viewer && loginData.data.viewer.login) || "";
+    } catch (e) {
+        ghUsername = "";
+    }
 }
 
 function mapGitHubEvent(ghEvent) {
@@ -1054,19 +1113,17 @@ function applyEventStats(eventType) {
     }
 }
 
-function pollGitHubActivity() {
+async function pollGitHubActivity() {
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
     const todayIso = todayStart.toISOString();
     const todayMs = todayStart.getTime();
 
-    // Use GraphQL for real-time issue/PR activity (no propagation delay)
     for (const repo of WATCHED_REPOS) {
         const [owner, name] = repo.split("/");
         try {
             const query = `{ repository(owner:"${owner}", name:"${name}") { issues(first:10, orderBy:{field:UPDATED_AT, direction:DESC}, filterBy:{since:"${todayIso}"}) { nodes { number title createdAt updatedAt state author { login } comments(last:1) { nodes { createdAt author { login } } } } } pullRequests(first:5, orderBy:{field:UPDATED_AT, direction:DESC}) { nodes { number title createdAt updatedAt state merged mergedAt author { login } } } } }`;
-            const result = execSync("gh api graphql -f query=" + JSON.stringify(query) + " 2>nul", { encoding: "utf-8", timeout: 15000 });
-            const data = JSON.parse(result || "{}");
+            const data = await ghGraphQL(query, 15000);
             const repoData = data.data && data.data.repository;
             if (!repoData) continue;
 
@@ -1168,9 +1225,11 @@ function pollGitHubActivity() {
     }
 }
 
-// Initial load + poll every 30s
-pollGitHubActivity();
-setInterval(pollGitHubActivity, 30000);
+// Async init: discover repos, then start polling (never blocks event loop)
+initGitHubData().then(() => {
+    pollGitHubActivity();
+    setInterval(() => pollGitHubActivity(), 30000);
+}).catch(() => {});
 
 const session = await joinSession({
     tools: [
